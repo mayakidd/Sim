@@ -1,0 +1,300 @@
+Option Base 1                   'all arrays begin at one (instead of zero, which is default)
+
+Dim r As Integer                'run number
+Dim r_Max As Integer            'number of runs to do
+Dim r_init As Integer           'number of runs done in initial analysis
+Dim step_num As Integer         'step number
+Dim n As Integer                'number of activities
+Dim W() As Single               'the work vector; activities with work remaining
+Dim Winit() As Single           'the initial values for the work vector
+Dim WN() As Boolean             'the "work now" vector; activities to work in current time step
+Dim event_act As Integer        'number of the activity driving the current event
+Dim IC() As Single              'the improvement curve vector
+Dim DSM() As Variant            'the DSM array containing iteration probabilities and rework amounts
+Dim stab_batch As Integer       'number of runs to do (batch) between output distribution stability checks
+Dim num_passes As Integer       'number of passes through process to do
+Dim c As Single                 'cost of an event
+Dim s As Single                 'duration of an event
+Dim Min_C As Single             'minimum cost sample from all runs
+Dim Max_C As Single             'maximum cost sample from all runs
+Dim Min_S As Single             'minimum duration sample from all runs
+Dim Max_S As Single             'maximum duration sample from all runs
+Dim ActC() As Single            'cost samples for newly beginning activities
+Dim ActS() As Single            'duration samples for newly beginning activities
+Dim ActC_3pt() As Single        'cost min, likely, max
+Dim ActS_3pt() As Single        'duration min, likely, max
+Dim CS_corr As Single           'user input correlation between cost and schedule samples
+Dim i, j, k As Integer          'counters
+Dim CSP_Samples() As Single     'dynamic array (9, r) of CSP samples resulting from runs (C,S,P,Pmin,Plikely,Pmax,PtechMin,PtechLikely,PtechMax)
+Dim current_means(3) As Single  'means of CSP_Samples(r,1 To 3)
+Dim current_vars(3) As Single   'variances of CSP_Samples(1 To 3, r)
+Dim last_means(3) As Single     'means of CSP_Samples(1 To 3, r-1)
+Dim last_vars(3) As Single      'variances of CSP_Samples(1 To 3, r-1)
+Dim last_means_check(3) As Single  'means of CSP_Samples(1 To 3, r-stab_batch)
+Dim last_vars_check(3) As Single   'variances of CSP_Samples(1 To 3, r-stab_batch)
+Dim PMF_stable As Single        'simulation stopping criteria, when PMF mean and variance less than this amount
+Dim Sequence_Vector() As Integer   'DSM sequencing vector
+Dim TC As Single                'cost target
+Dim TS As Single                'schedule target
+Dim C_unacc As Integer          'counter for number of unacceptable cost outcomes
+Dim S_unacc As Integer          'counter for number of unacceptable schedule outcomes
+Dim C_cum_impact As Single      'cumulative impact of cost overruns
+Dim S_cum_impact As Single      'cumulative impact of schedule overruns
+Dim C_impact_f_type As Integer
+Dim S_impact_f_type As Integer
+Dim Sim_Event As Integer        'indicates occurrence of a simulation event (of type #)
+Dim Step_Cumul_Time As Single   'time accumulated by executed portion of process
+Dim Step_Cumul_Cost As Single   'cost accumulated by executed portion of process
+Dim Sim_Cumul_Time As Single    'time accumulated by simulated portion of process
+Dim Sim_Cumul_Cost As Single    'cost accumulated by simulated portion of process
+Dim Step_wo_Sim As Boolean      'sets to step through project w/o simulating the rest/remainder
+Dim Step_w_rough_Sim As Boolean 'sets to step through project w/ only a rough sim of the remainder
+Dim Rework_Counter() As Integer 'counts number of times each activity has RE-WORKED (not worked)
+Dim RW_counter() As Integer     'rework counter for step-through
+Dim ignore_iteration As Single  'actually an INVERSE-Boolean flag (1 is false; 0 is true)
+
+
+Sub PPS()   'The full simulation, used for initial forecast and to reestimate remainder of process
+    
+    Dim finish_run As Boolean                                    'indicates a run is complete
+    Dim More_Runs As Boolean                                 'indicates simulation is complete
+    Dim delivery_date As Single
+
+    Initialization3                                              'initialization subroutine
+    More_Runs = True
+    Do While More_Runs      'actual simulation runs loop
+        r = r + 1                                                       'increment run #
+        Application.StatusBar = "     Run # " & r & " of " & r_Max      'display run # on status bar
+        Sim_Cumul_Time = 0
+        Sim_Cumul_Cost = 0
+        finish_run = False                                              'run is just beginning
+        ReDim Rework_Counter(n)
+        
+        For i = 1 To n
+            W(i) = Winit(i)                                             'initialize W vector
+            ActS(i) = Sample_TriPDF(ActS_3pt(i, 1), ActS_3pt(i, 2), ActS_3pt(i, 3))  'sample duration for ea. activity
+            ActC(i) = Sample_TriPDF(ActC_3pt(i, 1), ActC_3pt(i, 2), ActC_3pt(i, 3))  'sample cost for ea. activity
+            'ActC(i) = Corr_Sample_TriPDF(ActC_3pt(i, 1), ActC_3pt(i, 2), ActC_3pt(i, 3), CS_corr, ActS_3pt(i, 1), ActS_3pt(i, 2), ActS_3pt(i, 3), ActS(i))  'sample cost for each activity, possibly correlated with S sample
+            If i > 12 Then
+                Worksheets("Sim Data").Cells(12 + r, 23 + i - 12).Value = ActS(i)
+                Worksheets("Sim Data").Cells(12 + r, 38 + i - 12).Value = ActC(i)
+            End If
+        Next i
+        'Act_Resequencing                                                'call procedure to resequence CS samples
+    
+        Do While (finish_run = False) 'event loop
+            Sim_Event = 0                                               'init no event has occurred
+            Banding                                                     'subroutine to determine available activities
+            Det_Next_Event_Timing                                       'subroutine
+            Update_Process_State                                        'subroutine
+            
+            finish_run = True                                           'run is now finished…
+            For i = 1 To n
+                If W(i) <> 0 Then                                       '…unless any activity has more work to do
+                    finish_run = False
+                    Exit For
+                End If
+            Next i
+        Loop                                                            'next event
+        
+        CSP_Samples(1, r) = Step_Cumul_Cost + Sim_Cumul_Cost            'put run result for cost into array
+        CSP_Samples(2, r) = Step_Cumul_Time + Sim_Cumul_Time            'put run result for schedule into array
+        ReDim Preserve CSP_Samples(9, r + 1)                            'enlarge dynamic array to hold next run results
+        
+        If (r = 1) And (step_num = 0) Then                  'if first run of initial analysis, init variables
+            Min_C = CSP_Samples(1, 1)
+            Min_S = CSP_Samples(2, 1)
+            Max_C = Min_C
+            Max_S = Min_S
+        Else
+            If CSP_Samples(1, r) < Min_C Then Min_C = CSP_Samples(1, r)
+            If CSP_Samples(1, r) > Max_C Then Max_C = CSP_Samples(1, r)
+            If CSP_Samples(2, r) < Min_S Then Min_S = CSP_Samples(2, r)
+            If CSP_Samples(2, r) > Max_S Then Max_S = CSP_Samples(2, r)
+        End If
+        
+        If CSP_Samples(1, r) > TC Then
+            C_unacc = C_unacc + 1                                       'count as an unacceptable outcome
+            Select Case C_impact_f_type
+                Case 1                                                  'quadratic impact function
+                    C_cum_impact = C_cum_impact + (CSP_Samples(1, r) - TC) ^ 2
+                Case 2                                                  'linear impact function
+                    C_cum_impact = C_cum_impact + (CSP_Samples(1, r) - TC)
+                Case 3                                                  'custom impact function:  linear 2x
+                    C_cum_impact = C_cum_impact + 2 * (CSP_Samples(1, r) - TC)
+            End Select
+        End If
+        If CSP_Samples(2, r) > TS Then
+            S_unacc = S_unacc + 1                                       'count as an unacceptable outcome
+            Select Case S_impact_f_type
+                Case 1                                                  'quadratic impact function
+                    S_cum_impact = S_cum_impact + (CSP_Samples(2, r) - TS) ^ 2
+                Case 2                                                  'linear impact function
+                    S_cum_impact = S_cum_impact + (CSP_Samples(2, r) - TS)
+                Case 3                                                  'custom impact function:  utility function
+                    delivery_date = (CSP_Samples(2, r) - TS) / 11 + 18  'convert days late to months from start; assumes 22 days/month, 18 mo. target for final delivery, and each day late is likely to cause 2 days late for final delivery
+                    Select Case delivery_date
+                        Case Is <= 24
+                            S_cum_impact = S_cum_impact + 1667 - (1000 - (1000 - 1667) * (24 - delivery_date) / (24 - 18))
+                        Case Is <= 36
+                            S_cum_impact = S_cum_impact + 1667 - (500 - (500 - 1000) * (36 - delivery_date) / (36 - 24))
+                        Case Is > 36
+                            S_cum_impact = S_cum_impact + 1667
+                    End Select
+            End Select
+        End If
+    
+        If r_Max = 0 Then                                               'stopping criteria:
+            If Stop_Runs() = True Then More_Runs = False                'if using PMF stability, check for it
+        Else
+            If r = r_Max Then More_Runs = False                         'if using max # runs, check for it
+        End If
+    Loop                                                                'do another run
+    
+    Application.StatusBar = False                                       'clear status bar
+    Generate_Output                                                     'subroutine
+End Sub
+
+Sub Det_Next_Event_Timing()     'determines duration, s, of current event and advances sim clock
+    Dim temp As Single
+    s = 0
+    For i = 1 To n                                              'find shortest, available activity (time until next Event_Activity_Ends)
+        If WN(i) Then
+            If s = 0 Then
+                s = ActS(i) * W(i)                              'first activity checked is shortest...
+            Else
+                temp = ActS(i) * W(i)
+                If temp < s Then s = temp                       '...unless another activity is shorter
+            End If
+        End If
+    Next i
+    Sim_Cumul_Time = Sim_Cumul_Time + s                         'advance the simulation clock
+End Sub
+
+Sub Update_Process_State()  'decrements work vector, determines which activity just ended, and increments cumulative cost
+    Dim work_done As Double
+    
+    c = 0
+    For i = 1 To n
+        If WN(i) Then                                           'if activity available to work
+            work_done = s / ActS(i)
+            W(i) = W(i) - work_done                             'do work on these activities (work to do can't go below zero)
+            If W(i) < 0 Then work_done = work_done + W(i)       'prevents overpaying for partial activity
+            If W(i) < 0.001 Then W(i) = 0                       'prevents rounding errors
+            c = c + (ActC(i) * work_done)                      'add activity cost to total event cost
+            If W(i) = 0 Then Call Event_Activity_Ends(i)
+        End If
+    Next i
+    Sim_Cumul_Cost = Sim_Cumul_Cost + c                         'add cost of current event to cumulative project cost
+End Sub
+
+Sub Event_Activity_Ends(activity)
+    Dim temp As Single
+    Dim added_work() As Single
+    
+    ReDim added_work(n)
+    
+    'check for upstream rework
+    For k = 1 To activity - 1                                   'loop through column above newly finished activity
+        temp = ignore_iteration
+        If temp = 0.5 Then temp = Rnd
+        If (DSM(k, activity, 1) > 0) And (temp > 0.5) Then      'if there is a probability of rework, and iterations are being attended to, then
+            If Rnd <= DSM(k, activity, 1) Then                  'if rework occurs, then
+                temp = 0
+                added_work(k) = DSM(k, activity, 2) * IC(k)     'determine rework impact, diminished by improvement curve
+                If W(k) < 1 Then temp = W(k) + added_work(k)    'if affected activity has already done work, then determine rework to add
+                If temp > 1 Then temp = 0.9                     'but keep work from expanding beyond original scope
+                added_work(k) = max(temp - W(k), 0)             'actual amount of rework to add
+                If added_work(k) > 0 Then
+                    W(k) = W(k) + added_work(k)
+                    Rework_Counter(k) = Rework_Counter(k) + 1
+                    If Step_wo_Sim Or Step_w_rough_Sim Then RW_counter(k) = RW_counter(k) + 1
+                End If
+            End If
+        End If
+    Next k
+    
+    'if a REWORKING activity has ended, then also check for downstream rework
+    If Rework_Counter(activity) > 0 Then
+        For k = activity + 1 To n                                   'loop through column below newly finished activity
+            If (W(k) < 1) And (DSM(k, activity, 1) > 0) Then        'if the downstream activity has begun, and if there is a probability of rework, then
+                If Rnd <= DSM(k, activity, 1) Then                  'if rework occurs, then
+                    temp = 0
+                    added_work(k) = DSM(k, activity, 2) * IC(k)     'determine rework impact, diminished by improvement curve
+                    If W(k) < 1 Then temp = W(k) + added_work(k)    'if affected activity has already done work, then determine rework to add
+                    If temp > 1 Then temp = 0.9                     'but keep work from expanding beyond original scope
+                    added_work(k) = max(temp - W(k), 0)             'actual amount of rework to add
+                    If added_work(k) > 0 Then
+                        W(k) = W(k) + added_work(k)
+                        Rework_Counter(k) = Rework_Counter(k) + 1
+                        If Step_wo_Sim Or Step_w_rough_Sim Then RW_counter(k) = RW_counter(k) + 1
+                    End If
+                End If
+            End If
+        Next k
+    End If
+        
+End Sub
+
+Sub Banding()                       'determines available activities (consecutive AND have all upstream inputs)
+    Dim band_complete As Boolean    'flag that all available activities have been found
+    
+    For i = 1 To n
+        WN(i) = False               'init all activities to UNAVAILABLE
+    Next i
+    
+    For i = 1 To n                  'find first available activity
+        If W(i) > 0 Then
+            WN(i) = True
+            j = i + 1               'sets j to the following activity
+            Exit For                'leave loop once the first available activity is found
+        End If
+    Next i
+    
+    band_complete = False                                   'all activities for band have not been found
+    Do While (band_complete = False) And (j <= n)           'begin to identify remaining activities in the band
+        If W(j) > 0 Then                                    'if next activity needs work
+            For k = i To j - 1
+                If (DSM(j, k, 1) > 0) And (W(k) > 0) Then   'if dependent on an unfinished upstream activity
+                    band_complete = True                    'then the complete band has been found (Note:  this WORK POLICY could be changed)
+                    Exit For
+                End If
+            Next k                                          'keep checking vs. activities in band
+            If Not band_complete Then                       'if complete band not yet found…
+                WN(j) = True                                '…then make activity j AVAILABLE
+            Else
+                Exit Do                                     'if complete band found, then finished banding
+            End If
+        End If
+        j = j + 1
+    Loop                                                    'see if next activity can be added to the band
+End Sub
+
+Function Stop_Runs()
+    Dim temp As Single
+    
+    Stop_Runs = True
+    For i = 1 To 2 '(Abs(Do_Perf) + 2)                                                '2 = CS only; 3 = P also
+        last_means(i) = current_means(i)
+        last_vars(i) = current_vars(i)
+        current_means(i) = ((last_means(i) * (r - 1)) + CSP_Samples(i, r)) / r        'calculate mean, including latest run
+        temp = (last_vars(i) ^ 2 + last_means(i) ^ 2) * (r - 1)                       'find previous sum of squares
+        temp = (temp + CSP_Samples(i, r) ^ 2) / r                                     'add to sum of squares
+        current_vars(i) = Sqr(Abs(temp - current_means(i) ^ 2))                       'var.^2 = E[x^2] - E[x]^2
+        If (r / stab_batch) = Int(r / stab_batch) Then                                'check stabilities every so many runs (stability batch size)
+            If (Abs(current_means(i) - last_means_check(i)) / last_means_check(i)) > PMF_stable Then  'check stability of mean
+                Stop_Runs = False
+                last_means_check(i) = current_means(i)
+                Exit For
+            End If
+            If (Abs(current_vars(i) - last_vars_check(i)) / last_vars_check(i)) > PMF_stable Then     'check stab. of var.
+                Stop_Runs = False
+                last_vars_check(i) = current_vars(i)
+                Exit For
+            End If
+        Else
+            Stop_Runs = False
+        End If
+    Next i
+End Function
+
